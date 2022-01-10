@@ -12,7 +12,6 @@ namespace _15Puzzle
         private bool _logInFile = true;
         private bool _logInConsole = true;
         private HeuristicsEnum _heuristicMethod;
-        private Mutex _resultMutex = new Mutex();
 
         public Threaded (bool logInFile, bool logInConsole, HeuristicsEnum heuristicMethod)
         {
@@ -21,20 +20,17 @@ namespace _15Puzzle
             this._heuristicMethod = heuristicMethod;
 
             int maxWorker, maxIOC;
-            // Get the current settings.
             ThreadPool.GetMaxThreads(out maxWorker, out maxIOC);
-            Console.WriteLine(maxWorker + " " + maxIOC);
             ThreadPool.SetMaxThreads(Config.NUMBER_OF_THREADS, maxIOC);
         }
 
 
         public void Run() {
-            Console.WriteLine(Matrix.ToString());
+            Console.WriteLine($"Initial matrix: \n\n {Matrix.ToString()}");
 
             var startTime = DateTime.Now;
             var solveResult = Solve();
             var endTime = DateTime.Now;
-
             var finalMatrix = solveResult.Item1;
             var foundSolution = solveResult.Item2;
             var finalHeuristicDistance = solveResult.Item3;
@@ -42,42 +38,50 @@ namespace _15Puzzle
             if (_logInConsole)
             {
                 Console.WriteLine($"Run time: {(endTime - startTime).TotalMilliseconds / 1000} seconds");
-
                 Console.WriteLine($"Resulting matrix: \n{finalMatrix}\nSteps:{finalMatrix.stepsCount}\nFinal heuristic distance: {finalHeuristicDistance}\n\n");
             }
-
             if (_logInFile)
             {
                 File.AppendAllText(Config.LOG_PATH, "Regular sequential algorithm: " + (endTime - startTime).TotalMilliseconds / 1000 + " seconds\n");
             }
         }
 
+        /*
+         * Attempts to solve the puzzle.
+         * 
+         * @returns a tuple containing:
+         *  1. the final puzzle layout (the furthest we could reach)
+         *  2. a boolean indicating whether we found a solution or not
+         *  3. the best f
+         */
         private Tuple<Matrix, bool, int> Solve()
         {
-            int bestHDistance = Matrix.GetHeuristic(_heuristicMethod);
-            int distance = 0;
+            int bestF = Matrix.GetHeuristic(_heuristicMethod);
+            int newF;
 
+            // While no solution found
             while (true)
             {
-                var solution = SearchParallel(Matrix, 0, bestHDistance, Config.NUMBER_OF_THREADS);
+                // Search again for a solution, based on the previously found best f
+                var solution = SearchParallel(Matrix, 0, bestF, Config.NUMBER_OF_THREADS);
+                newF = solution.Item1;
 
-                Console.WriteLine($"Solution matrix:\n{solution.Item2}\nSteps: {solution.Item1}\nManhattan: {solution.Item2.GetHeuristic(HeuristicsEnum.Manhattan)}");
+                // Log iteration results
+                Console.WriteLine($"Solution matrix:\n{solution.Item2}\nf: {solution.Item1}\nManhattan: {solution.Item2.GetHeuristic(HeuristicsEnum.Manhattan)}");
+                
+                // If distance = 1, which by conventions means that we found a solution to the puzzle, then return the solution
+                if (newF == -1 || newF >= 80) return new Tuple<Matrix, bool, int>(solution.Item2, newF == -1, newF);
 
-                distance = solution.Item1;
-
-                if (distance == -1)
-                {
-                    return new Tuple<Matrix, bool, int>(solution.Item2, distance == -1, distance);
-                }
-
-                bestHDistance = distance;
+                // Otherwise, just update the best f with the newly found f, which will be used on the next iteration.
+                bestF = newF;
             }
         }
         
-        private Tuple<int, Matrix> SearchSequential(Matrix current, int stepsCount, int bestHDistance, int unused)
+        private Tuple<int, Matrix> SearchSequential(Matrix current, int stepsCount, int bestF)
         {
-            var currentStateEvaluation = EvaluateCurrentState(current, stepsCount, bestHDistance);
-            if (currentStateEvaluation != null) return currentStateEvaluation;
+            // Check base conditions and stop(return) if needed
+            var baseCondition = SearchBaseConditions(current, stepsCount, bestF);
+            if (baseCondition != null) return baseCondition;
             
             int min = Int32.MaxValue;
             Matrix bestOutcome = null;
@@ -87,17 +91,12 @@ namespace _15Puzzle
             //else Console.WriteLine("***");
             //Console.WriteLine("Origin matrix:\n" + current.ToString() + "\n");
 
-            foreach (Matrix nextMatrix in current.generateMoves())
-            {
-                //Console.WriteLine("Next matrix:\n" + nextMatrix.ToString() + "\n");
-                var result = SearchSequential(nextMatrix, stepsCount + 1, bestHDistance, 0);
-
+            foreach (Matrix nextMatrix in current.generateMoves()) {
+                var result = SearchSequential(nextMatrix, stepsCount + 1, bestF);
                 var resultEstimation = result.Item1;
 
                 if (resultEstimation == -1) return new Tuple<int, Matrix>(-1, result.Item2);
-
-                if (resultEstimation < min)
-                {
+                if (resultEstimation < min) {
                     min = resultEstimation;
                     bestOutcome = result.Item2;
                 }
@@ -106,37 +105,28 @@ namespace _15Puzzle
             return new Tuple<int, Matrix>(min, bestOutcome);
         }
 
-        private Tuple<int,Matrix> SearchParallel(Matrix current, int stepsCount, int bestHDistance, int threadCount)
+        private Tuple<int,Matrix> SearchParallel(Matrix current, int stepsCount, int bestF, int threadCount)
         {
-            if (threadCount <= 1) return SearchSequential(current, stepsCount, bestHDistance, 0);
+            // If no more threads available to do parralel search, then go for a sequential search
+            if (threadCount <= 1) return SearchSequential(current, stepsCount, bestF);
 
-            var currentStateEvaluation = EvaluateCurrentState(current, stepsCount, bestHDistance);
-            if (currentStateEvaluation != null) return currentStateEvaluation;
+            // Check base conditions and stop (return) if needed
+            var baseCondition = SearchBaseConditions(current, stepsCount, bestF);
+            if (baseCondition != null) return baseCondition;
+
 
             int min = Int32.MaxValue;
             var generatedMoves = current.generateMoves();
-
-            //foreach(var m in generatedMoves)
-            //{
-            //    Console.WriteLine(m);
-            //}
-            
             List<Tuple<int, Matrix>> results = new List<Tuple<int, Matrix>>();
-
             var countdownEvent = new CountdownEvent(1);
-
             var bestOutcome = current;
-
             foreach (Matrix nextMatrix in generatedMoves)
             {
                 countdownEvent.AddCount();
                 ThreadPool.QueueUserWorkItem(state =>
                 {
-                    var localResult = SearchParallel(nextMatrix, stepsCount + 1, bestHDistance, threadCount / generatedMoves.Count);
-
-                    _resultMutex.WaitOne();
+                    var localResult = SearchParallel(nextMatrix, stepsCount + 1, bestF, threadCount / generatedMoves.Count);
                     results.Add(localResult);
-                    _resultMutex.ReleaseMutex();
                     countdownEvent.Signal();
                 });
             }
@@ -158,14 +148,24 @@ namespace _15Puzzle
             return new Tuple<int, Matrix>(min, bestOutcome);
         }
 
-        private Tuple<int, Matrix> EvaluateCurrentState(Matrix current, int stepsCount, int bestHDistance)
+        /*
+         * @param current           - the current puzzle layouyt
+         * @param stepsCount        - the number of steps (slides) performed so far
+         * @param bestF - the best (i.e. minimum / smallest) distance to the target
+         * 
+         * Handles the base conditions of the reccursive search functions
+         * 
+         * @returns - if the current f is worse that the best f found so far, then stop looking further on this reccursion branch (we cannot find a better solution)
+         *          - if the current h is zero, then we solved the puzzle, so we should return the new best solution (we use -1 for distance to indicate that we found a solution)
+         */
+        private Tuple<int, Matrix>? SearchBaseConditions(Matrix current, int stepsCount, int bestF)
         {
-            int f = stepsCount + current.GetHeuristic(_heuristicMethod);
+            int g = stepsCount;
+            int h = current.GetHeuristic(_heuristicMethod);
+            int f = g + h;
 
-            if (f > bestHDistance || f > Config.MOVE_THRESHOLD) return new Tuple<int, Matrix>(f, current);
-
-            if (current.GetHeuristic(_heuristicMethod) == 0) return new Tuple<int, Matrix>(-1, current);
-
+            if (f > bestF || f > Config.MOVE_THRESHOLD) return new Tuple<int, Matrix>(f, current);
+            if (h == 0) return new Tuple<int, Matrix>(-1, current);
             return null;
         }
     }

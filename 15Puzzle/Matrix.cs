@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 
 namespace _15Puzzle
 {
+    [Serializable]
     public class Matrix
     {
         private Dictionary<DirectionEnum, Tuple<int, int>> _directions = new Dictionary<DirectionEnum, Tuple<int, int>>
